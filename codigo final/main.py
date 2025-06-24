@@ -11,6 +11,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 import queue
+import string
+import re
 
 class ServoControllerGPIO14:
     def __init__(self, pin=14):
@@ -151,8 +153,25 @@ class ASLRecognizer:
         self.model_path = model_path
         self.recognizer = None
         self.last_speech_time = 0
-        self.speech_delay = 2.0
+        self.speech_delay = 1.5  # Reducido para mejor respuesta
         self.last_gesture = ""
+        self.gesture_history = []
+        self.confidence_threshold = 0.65  # Reducido para mejor detección
+        self.stability_frames = 3  # Frames necesarios para confirmar gesto
+        self.current_stable_gesture = ""
+        self.stable_count = 0
+        
+        # Mapeo de gestos mejorado
+        self.gesture_mapping = {
+            'Thumb_Up': 'A',
+            'Thumbs_Up': 'A',
+            'Open_Palm': 'B',
+            'Victory': 'V',
+            'ILoveYou': 'I',
+            'Closed_Fist': 'S',
+            'Pointing_Up': '1',
+            'None': '',
+        }
         
         print("MediaPipe version:", mp.__version__)
         
@@ -160,7 +179,11 @@ class ASLRecognizer:
             base_options = python.BaseOptions(model_asset_path=self.model_path)
             options = vision.GestureRecognizerOptions(
                 base_options=base_options,
-                running_mode=vision.RunningMode.IMAGE
+                running_mode=vision.RunningMode.IMAGE,
+                num_hands=1,  # Optimizar para una mano
+                min_hand_detection_confidence=0.5,
+                min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5
             )
             self.recognizer = vision.GestureRecognizer.create_from_options(options)
             print("✓ Reconocedor ASL inicializado correctamente")
@@ -168,48 +191,94 @@ class ASLRecognizer:
             print(f"❌ Error al cargar el modelo ASL: {e}")
             self.recognizer = None
     
-    def speak_gesture(self, gesture_name):
+    def speak_letter(self, letter):
         """Función para reproducir la letra usando espeak en español"""
         try:
-            print(f"Pronunciando: {gesture_name}")
-            os.system(f'espeak -v es "{gesture_name}" 2>/dev/null')
+            if letter.upper() in string.ascii_uppercase:
+                print(f"Pronunciando letra: {letter}")
+                os.system(f'espeak -v es+f3 -s 120 "{letter}" 2>/dev/null &')
         except Exception as e:
-            print(f"Error TTS: {e}")
+            print(f"Error TTS letra: {e}")
+    
+    def get_mapped_gesture(self, gesture_name):
+        """Mapea el gesto detectado a una letra"""
+        return self.gesture_mapping.get(gesture_name, gesture_name)
     
     def recognize_gesture(self, frame_rgb):
-        """Reconoce gestos en el frame y retorna información"""
-        if self.recognizer is None:
-            return None, "Reconocedor no disponible", False
-        
-        try:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-            result = self.recognizer.recognize(mp_image)
-            
-            if result.gestures:
-                top_gesture = result.gestures[0][0]
-                confidence = top_gesture.score
-                current_time = time.time()
-                
-                if confidence > 0.7:
+            """Reconoce gestos en el frame con mejor estabilidad y devuelve caja de la mano"""
+            if self.recognizer is None:
+                return None, "Reconocedor no disponible", False, "", None
+
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                result = self.recognizer.recognize(mp_image)
+
+                hand_box = None  # Coordenadas (x1, y1, x2, y2)
+
+                # Obtener caja si hay landmarks
+                if result.hand_landmarks:
+                    landmarks = result.hand_landmarks[0]
+                    x_list = [lm.x for lm in landmarks]
+                    y_list = [lm.y for lm in landmarks]
+                    min_x, max_x = min(x_list), max(x_list)
+                    min_y, max_y = min(y_list), max(y_list)
+
+                    # Convertir coordenadas relativas a píxeles
+                    h, w, _ = frame_rgb.shape
+                    margin = 20  # píxeles extra alrededor de la mano
+
+                    x1 = max(0, int(min_x * w) - margin)
+                    y1 = max(0, int(min_y * h) - margin)
+                    x2 = min(w, int(max_x * w) + margin)
+                    y2 = min(h, int(max_y * h) + margin)
+
+                    hand_box = (x1, y1, x2, y2)
+
+                if result.gestures and len(result.gestures) > 0:
+                    top_gesture = result.gestures[0][0]
+                    confidence = top_gesture.score
                     gesture_name = top_gesture.category_name
-                    
-                    if (gesture_name != self.last_gesture and 
-                        current_time - self.last_speech_time > self.speech_delay):
-                        self.speak_gesture(gesture_name)
-                        self.last_speech_time = current_time
-                        self.last_gesture = gesture_name
-                    
-                    return confidence, f"{gesture_name}", True
+
+                    if confidence > self.confidence_threshold:
+                        mapped_letter = self.get_mapped_gesture(gesture_name)
+
+                        if gesture_name == self.current_stable_gesture:
+                            self.stable_count += 1
+                        else:
+                            self.current_stable_gesture = gesture_name
+                            self.stable_count = 1
+
+                        if self.stable_count >= self.stability_frames:
+                            current_time = time.time()
+
+                            if (gesture_name != self.last_gesture and 
+                                current_time - self.last_speech_time > self.speech_delay and
+                                mapped_letter and mapped_letter != ''):
+
+                                self.speak_letter(mapped_letter)
+                                self.last_speech_time = current_time
+                                self.last_gesture = gesture_name
+
+                                return confidence, f"{gesture_name} → {mapped_letter}", True, mapped_letter, hand_box
+                            else:
+                                return confidence, f"{gesture_name} → {mapped_letter}", True, "", hand_box
+                        else:
+                            return confidence, f"Estabilizando... {gesture_name}", False, "", hand_box
+                    else:
+                        self.current_stable_gesture = ""
+                        self.stable_count = 0
+                        self.last_gesture = ""
+                        return confidence, f"Gesto débil: {gesture_name}", False, "", hand_box
                 else:
+                    self.current_stable_gesture = ""
+                    self.stable_count = 0
                     self.last_gesture = ""
-                    return confidence, "Gesto no claro", False
-            else:
-                self.last_gesture = ""
-                return 0.0, "Sin gesto detectado", False
-                
-        except Exception as e:
-            print(f"Error en detección ASL: {e}")
-            return None, "Error en detección", False
+                    return 0.0, "Sin mano detectada", False, "", hand_box
+
+            except Exception as e:
+                print(f"Error en detección ASL: {e}")
+                return None, "Error en detección", False, "", None
+
 
 def load_face_cascade():
     """Carga el clasificador de caras con rutas alternativas"""
@@ -227,11 +296,51 @@ def load_face_cascade():
     print("❌ No se pudo cargar el clasificador de caras")
     return None
 
+class TTSController:
+    def __init__(self):
+        self.is_speaking = False
+        self.tts_thread = None
+    
+    def speak_text(self, text):
+        """Reproduce texto usando espeak en español"""
+        if self.is_speaking:
+            return False
+        
+        try:
+            if text.strip():
+                self.is_speaking = True
+                self.tts_thread = threading.Thread(target=self._speak_worker, args=(text,), daemon=True)
+                self.tts_thread.start()
+                return True
+        except Exception as e:
+            print(f"Error TTS: {e}")
+            self.is_speaking = False
+        
+        return False
+    
+    def _speak_worker(self, text):
+        """Worker para reproducir texto en hilo separado"""
+        try:
+            # Limpiar texto y preparar para TTS
+            clean_text = re.sub(r'[^a-zA-ZáéíóúÁÉÍÓÚñÑ\s]', '', text)
+            if clean_text.strip():
+                print(f"🔊 Reproduciendo: {clean_text}")
+                os.system(f'espeak -v es+f3 -s 150 "{clean_text}" 2>/dev/null')
+            sleep(0.5)  # Pausa breve
+        except Exception as e:
+            print(f"Error en TTS worker: {e}")
+        finally:
+            self.is_speaking = False
+    
+    def is_busy(self):
+        """Verifica si el TTS está ocupado"""
+        return self.is_speaking
+
 class ASLGui:
     def __init__(self, root):
         self.root = root
-        self.root.title("Sistema de Reconocimiento ASL")
-        self.root.geometry("800x700")
+        self.root.title("Sistema de Reconocimiento ASL Avanzado")
+        self.root.geometry("900x800")
         self.root.configure(bg='#2c3e50')
         
         # Variables de control
@@ -241,6 +350,7 @@ class ASLGui:
         self.led_controller = None
         self.asl_recognizer = None
         self.face_cascade = None
+        self.tts_controller = TTSController()
         
         # Cola para comunicación entre hilos
         self.update_queue = queue.Queue()
@@ -252,18 +362,26 @@ class ASLGui:
         self.ganancia_critica = 0.7
         self.face_tracking_enabled = True
         
+        # Variables de texto interpretado
+        self.interpreted_text = ""
+        self.max_text_length = 200
+        
         self.setup_gui()
         self.init_components()
         
     def setup_gui(self):
-        """Configura la interfaz gráfica"""
+        """Configura la interfaz gráfica mejorada"""
         # Título principal
         title_frame = tk.Frame(self.root, bg='#2c3e50')
         title_frame.pack(pady=10)
         
-        title_label = tk.Label(title_frame, text="Sistema de Reconocimiento ASL", 
+        title_label = tk.Label(title_frame, text="Sistema de Reconocimiento ASL Avanzado", 
                               font=('Arial', 20, 'bold'), fg='white', bg='#2c3e50')
         title_label.pack()
+        
+        subtitle_label = tk.Label(title_frame, text="Interpretación en Tiempo Real con TTS", 
+                                 font=('Arial', 12), fg='#bdc3c7', bg='#2c3e50')
+        subtitle_label.pack()
         
         # Frame para la cámara
         self.camera_frame = tk.Frame(self.root, bg='#34495e', relief='sunken', bd=2)
@@ -273,53 +391,110 @@ class ASLGui:
         self.video_label = tk.Label(self.camera_frame, bg='black')
         self.video_label.pack(expand=True, fill='both')
         
-        # Frame inferior para controles y texto
-        bottom_frame = tk.Frame(self.root, bg='#2c3e50')
-        bottom_frame.pack(pady=10, padx=20, fill='x')
+        # Frame principal para controles
+        main_control_frame = tk.Frame(self.root, bg='#2c3e50')
+        main_control_frame.pack(pady=10, padx=20, fill='x')
         
-        # Frame para el texto interpretado
-        text_frame = tk.Frame(bottom_frame, bg='#2c3e50')
-        text_frame.pack(side='left', fill='both', expand=True)
+        # Frame izquierdo - Información de gestos
+        left_frame = tk.Frame(main_control_frame, bg='#2c3e50')
+        left_frame.pack(side='left', fill='both', expand=True)
         
-        # Label para mostrar el gesto interpretado
-        gesture_title = tk.Label(text_frame, text="Gesto Detectado:", 
+        # Información del gesto actual
+        gesture_title = tk.Label(left_frame, text="Gesto Detectado:", 
                                 font=('Arial', 12, 'bold'), fg='white', bg='#2c3e50')
         gesture_title.pack(anchor='w')
         
-        self.gesture_label = tk.Label(text_frame, text="Sin gesto detectado", 
-                                     font=('Arial', 16), fg='#ecf0f1', bg='#34495e',
+        self.gesture_label = tk.Label(left_frame, text="Sin gesto detectado", 
+                                     font=('Arial', 14), fg='#ecf0f1', bg='#34495e',
                                      relief='sunken', bd=2, padx=10, pady=5)
         self.gesture_label.pack(fill='x', pady=5)
         
         # Label para mostrar la confianza
-        self.confidence_label = tk.Label(text_frame, text="Confianza: 0%", 
+        self.confidence_label = tk.Label(left_frame, text="Confianza: 0%", 
                                         font=('Arial', 10), fg='#bdc3c7', bg='#2c3e50')
         self.confidence_label.pack(anchor='w')
         
-        # Frame para botones
-        button_frame = tk.Frame(bottom_frame, bg='#2c3e50')
-        button_frame.pack(side='right', padx=(20, 0))
-        
-        # Botón TTS (para futuro)
-        self.tts_button = tk.Button(button_frame, text="🔊 TTS", 
-                                   font=('Arial', 12, 'bold'), bg='#3498db', fg='white',
-                                   relief='raised', bd=2, padx=20, pady=10,
-                                   state='disabled')  # Deshabilitado por ahora
-        self.tts_button.pack(pady=5)
+        # Frame derecho - Botones principales
+        right_frame = tk.Frame(main_control_frame, bg='#2c3e50')
+        right_frame.pack(side='right', padx=(20, 0))
         
         # Botón de control principal
-        self.control_button = tk.Button(button_frame, text="▶ Iniciar", 
+        self.control_button = tk.Button(right_frame, text="▶ Iniciar", 
                                        font=('Arial', 12, 'bold'), bg='#27ae60', fg='white',
                                        relief='raised', bd=2, padx=20, pady=10,
                                        command=self.toggle_system)
         self.control_button.pack(pady=5)
         
         # Botón centrar servo
-        self.center_button = tk.Button(button_frame, text="⚪ Centrar", 
+        self.center_button = tk.Button(right_frame, text="⚪ Centrar", 
                                       font=('Arial', 10), bg='#f39c12', fg='white',
                                       relief='raised', bd=2, padx=15, pady=5,
                                       command=self.center_servo)
         self.center_button.pack(pady=2)
+        
+        # === NUEVA SECCIÓN: TEXTO INTERPRETADO ===
+        text_frame = tk.Frame(self.root, bg='#2c3e50')
+        text_frame.pack(pady=10, padx=20, fill='x')
+        
+        # Título del cuadro de texto
+        text_title_frame = tk.Frame(text_frame, bg='#2c3e50')
+        text_title_frame.pack(fill='x', pady=(0, 5))
+        
+        text_title = tk.Label(text_title_frame, text="Texto Interpretado:", 
+                             font=('Arial', 12, 'bold'), fg='white', bg='#2c3e50')
+        text_title.pack(side='left')
+        
+        # Contador de caracteres
+        self.char_counter = tk.Label(text_title_frame, text="0/200", 
+                                    font=('Arial', 10), fg='#95a5a6', bg='#2c3e50')
+        self.char_counter.pack(side='right')
+        
+        # Frame para el cuadro de texto y scrollbar
+        text_widget_frame = tk.Frame(text_frame, bg='#34495e', relief='sunken', bd=2)
+        text_widget_frame.pack(fill='x', pady=5)
+        
+        # Cuadro de texto con scrollbar
+        self.text_widget = tk.Text(text_widget_frame, height=4, font=('Arial', 14), 
+                                  bg='#ecf0f1', fg='#2c3e50', wrap=tk.WORD,
+                                  relief='flat', bd=0, padx=10, pady=5)
+        
+        scrollbar = tk.Scrollbar(text_widget_frame, orient='vertical', command=self.text_widget.yview)
+        self.text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        self.text_widget.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Frame para botones de texto
+        text_buttons_frame = tk.Frame(text_frame, bg='#2c3e50')
+        text_buttons_frame.pack(fill='x', pady=5)
+        
+        # Botón TTS mejorado
+        self.tts_button = tk.Button(text_buttons_frame, text="🔊 Leer Texto", 
+                                   font=('Arial', 11, 'bold'), bg='#3498db', fg='white',
+                                   relief='raised', bd=2, padx=20, pady=8,
+                                   command=self.read_text_aloud)
+        self.tts_button.pack(side='left', padx=5)
+        
+        # Botón para limpiar texto
+        self.clear_button = tk.Button(text_buttons_frame, text="🗑️ Limpiar", 
+                                     font=('Arial', 11), bg='#e74c3c', fg='white',
+                                     relief='raised', bd=2, padx=15, pady=8,
+                                     command=self.clear_text)
+        self.clear_button.pack(side='left', padx=5)
+        
+        # Botón para agregar espacio
+        self.space_button = tk.Button(text_buttons_frame, text="⎵ Espacio", 
+                                     font=('Arial', 11), bg='#95a5a6', fg='white',
+                                     relief='raised', bd=2, padx=15, pady=8,
+                                     command=self.add_space)
+        self.space_button.pack(side='left', padx=5)
+        
+        # Botón para borrar última letra
+        self.backspace_button = tk.Button(text_buttons_frame, text="⌫ Borrar", 
+                                         font=('Arial', 11), bg='#e67e22', fg='white',
+                                         relief='raised', bd=2, padx=15, pady=8,
+                                         command=self.backspace_text)
+        self.backspace_button.pack(side='left', padx=5)
         
         # Frame para información del sistema
         info_frame = tk.Frame(self.root, bg='#2c3e50')
@@ -333,6 +508,11 @@ class ASLGui:
         self.servo_label = tk.Label(info_frame, text="Servo: 90°", 
                                    font=('Arial', 10), fg='#95a5a6', bg='#2c3e50')
         self.servo_label.pack(side='right')
+        
+        # Label de estado TTS
+        self.tts_status_label = tk.Label(info_frame, text="TTS: Listo", 
+                                        font=('Arial', 10), fg='#95a5a6', bg='#2c3e50')
+        self.tts_status_label.pack(side='right', padx=(0, 20))
         
     def init_components(self):
         """Inicializa los componentes del sistema"""
@@ -413,11 +593,81 @@ class ASLGui:
             self.servo.set_angle(90)
             print("🎯 Servo centrado")
     
+    # === NUEVAS FUNCIONES PARA MANEJO DE TEXTO ===
+    def add_letter_to_text(self, letter):
+        """Agrega una letra al texto interpretado"""
+        if len(self.interpreted_text) < self.max_text_length:
+            self.interpreted_text += letter.upper()
+            self.update_text_display()
+            print(f"📝 Letra agregada: {letter} → Texto: {self.interpreted_text}")
+    
+    def update_text_display(self):
+        """Actualiza la visualización del texto"""
+        self.text_widget.delete(1.0, tk.END)
+        self.text_widget.insert(1.0, self.interpreted_text)
+        
+        # Actualizar contador de caracteres
+        char_count = len(self.interpreted_text)
+        self.char_counter.config(text=f"{char_count}/{self.max_text_length}")
+        
+        # Cambiar color del contador si está cerca del límite
+        if char_count > self.max_text_length * 0.8:
+            self.char_counter.config(fg='#e74c3c')
+        else:
+            self.char_counter.config(fg='#95a5a6')
+    
+    def read_text_aloud(self):
+        """Lee el texto interpretado usando TTS"""
+        text_to_read = self.text_widget.get(1.0, tk.END).strip()
+        
+        if not text_to_read:
+            messagebox.showwarning("Advertencia", "No hay texto para leer")
+            return
+        
+        if self.tts_controller.is_busy():
+            messagebox.showinfo("Información", "El sistema TTS está ocupado")
+            return
+        
+        success = self.tts_controller.speak_text(text_to_read)
+        if success:
+            self.tts_status_label.config(text="TTS: Hablando...", fg='#3498db')
+            # Programar actualización del estado
+            self.root.after(3000, self.reset_tts_status)
+        else:
+            messagebox.showerror("Error", "No se pudo iniciar el TTS")
+    
+    def reset_tts_status(self):
+        """Resetea el estado del TTS"""
+        if not self.tts_controller.is_busy():
+            self.tts_status_label.config(text="TTS: Listo", fg='#95a5a6')
+        else:
+            self.root.after(1000, self.reset_tts_status)
+    
+    def clear_text(self):
+        """Limpia el texto interpretado"""
+        self.interpreted_text = ""
+        self.update_text_display()
+        print("🗑️ Texto limpiado")
+    
+    def add_space(self):
+        """Agrega un espacio al texto"""
+        if len(self.interpreted_text) < self.max_text_length:
+            self.interpreted_text += " "
+            self.update_text_display()
+            print("⎵ Espacio agregado")
+    
+    def backspace_text(self):
+        """Borra la última letra del texto"""
+        if self.interpreted_text:
+            self.interpreted_text = self.interpreted_text[:-1]
+            self.update_text_display()
+            print("⌫ Última letra borrada")
+    
     def process_video(self):
-        """Procesa el video en un hilo separado"""
+        """Procesa el video en un hilo separado con mejoras ASL"""
         frame_count = 0
         no_face_count = 0
-        asl_process_interval = 4
+        asl_process_interval = 3  # Procesamiento más frecuente
         face_process_interval = 2
         last_debug_time = 0
         
@@ -432,20 +682,31 @@ class ASLGui:
                 frame_center_x = frame.shape[1] // 2
                 frame_width = frame.shape[1]
                 
-                # === RECONOCIMIENTO ASL ===
+                # === RECONOCIMIENTO ASL MEJORADO ===
                 gesture_text = "Procesando..."
                 confidence = 0.0
                 gesture_detected = False
+                new_letter = ""
                 
                 if frame_count % asl_process_interval == 0:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    confidence, gesture_text, gesture_detected = self.asl_recognizer.recognize_gesture(frame_rgb)
+                    confidence, gesture_text, gesture_detected, new_letter, hand_box = self.asl_recognizer.recognize_gesture(frame_rgb)
+
+                    # Dibuja el rectángulo si hay una mano detectada
+                    if hand_box:
+                        x1, y1, x2, y2 = hand_box
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
                     
-                    # Control de LEDs
-                    if gesture_detected and confidence > 0.7:
+                    # Control de LEDs mejorado
+                    if gesture_detected and confidence and confidence > 0.65:
                         self.led_controller.set_gesture_detected()
                     else:
                         self.led_controller.set_no_gesture()
+                    
+                    # Agregar letra al texto si es válida
+                    if new_letter and new_letter.strip():
+                        self.update_queue.put(('new_letter', new_letter))
                     
                     # Enviar actualización a la GUI
                     self.update_queue.put(('gesture', gesture_text, confidence, gesture_detected))
@@ -555,15 +816,23 @@ class ASLGui:
                     # Actualizar información del gesto
                     gesture_text, confidence, gesture_detected = data[1], data[2], data[3]
                     
-                    if confidence is not None and confidence > 0.7:
+                    if confidence is not None and confidence > 0.65:
                         self.gesture_label.config(text=gesture_text, bg='#27ae60')
                         self.confidence_label.config(text=f"Confianza: {confidence:.0%}", fg='#27ae60')
-                    elif confidence is not None:
+                    elif confidence is not None and confidence > 0.4:
                         self.gesture_label.config(text=gesture_text, bg='#f39c12')
                         self.confidence_label.config(text=f"Confianza: {confidence:.0%}", fg='#f39c12')
+                    elif confidence is not None:
+                        self.gesture_label.config(text=gesture_text, bg='#95a5a6')
+                        self.confidence_label.config(text=f"Confianza: {confidence:.0%}", fg='#95a5a6')
                     else:
                         self.gesture_label.config(text="Error en detección", bg='#e74c3c')
                         self.confidence_label.config(text="Confianza: 0%", fg='#e74c3c')
+                
+                elif data[0] == 'new_letter':
+                    # Agregar nueva letra al texto interpretado
+                    new_letter = data[1]
+                    self.add_letter_to_text(new_letter)
                 
                 elif data[0] == 'servo':
                     # Actualizar información del servo
@@ -583,6 +852,9 @@ class ASLGui:
         print("Cerrando aplicación...")
         self.running = False
         
+        # Esperar un momento para que los hilos terminen
+        sleep(0.5)
+        
         if self.cap:
             self.cap.release()
         
@@ -595,8 +867,23 @@ class ASLGui:
         self.root.destroy()
 
 def main():
-    print("🎯 SISTEMA ASL CON INTERFAZ GRÁFICA")
-    print("=" * 50)
+    print("🎯 SISTEMA ASL AVANZADO CON TTS E INTERPRETACIÓN")
+    print("=" * 60)
+    print("✨ Características:")
+    print("   • Reconocimiento ASL mejorado con estabilidad")
+    print("   • Texto interpretado en tiempo real")
+    print("   • Síntesis de voz (TTS) en español")
+    print("   • Seguimiento facial con servo")
+    print("   • Control de LEDs indicadores")
+    print("   • Interfaz gráfica intuitiva")
+    print("=" * 60)
+    
+    # Verificar dependencias críticas
+    try:
+        import espeak
+        print("✓ eSpeak disponible para TTS")
+    except ImportError:
+        print("⚠️  eSpeak no encontrado - instalar con: sudo apt-get install espeak espeak-data")
     
     root = tk.Tk()
     app = ASLGui(root)
@@ -605,10 +892,13 @@ def main():
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
     try:
+        print("\n🚀 Iniciando interfaz gráfica...")
         root.mainloop()
     except KeyboardInterrupt:
         print("\n🛑 Interrumpido por usuario")
         app.on_closing()
+    finally:
+        print("👋 Sistema cerrado correctamente")
 
 if __name__ == "__main__":
     main()

@@ -523,6 +523,17 @@ class ASLGui:
             self.asl_recognizer = ASLRecognizer()
             self.face_cascade = load_face_cascade()
             
+            # Configura los botones físicos
+            self.button_delete_pin = 17
+            self.button_tts_pin = 27
+
+            GPIO.setup(self.button_delete_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(self.button_tts_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+            # Detecta pulsaciones con rebote
+            GPIO.add_event_detect(self.button_delete_pin, GPIO.FALLING, callback=self.physical_backspace, bouncetime=300)
+            GPIO.add_event_detect(self.button_tts_pin, GPIO.FALLING, callback=self.physical_read_text, bouncetime=300)
+            
             if self.face_cascade is None:
                 print("⚠️  Continuando sin seguimiento facial...")
                 
@@ -865,6 +876,17 @@ class ASLGui:
             self.servo.cleanup()
         
         self.root.destroy()
+        
+    def physical_backspace(self, channel):
+        """Callback para botón físico que borra una letra"""
+        print("📴 Botón físico: borrar letra")
+        self.backspace_text()
+
+    def physical_read_text(self, channel):
+        """Callback para botón físico que lee el texto con TTS"""
+        print("🔊 Botón físico: leer texto")
+        self.read_text_aloud()
+
 
 def main():
     print("🎯 SISTEMA ASL AVANZADO CON TTS E INTERPRETACIÓN")

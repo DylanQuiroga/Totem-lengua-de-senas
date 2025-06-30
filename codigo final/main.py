@@ -170,8 +170,10 @@ class ASLRecognizer:
             'ILoveYou': 'I',
             'Closed_Fist': 'S',
             'Pointing_Up': '1',
+            'space': ' ',        # ← esta es la línea clave
             'None': '',
         }
+
         
         print("MediaPipe version:", mp.__version__)
         
@@ -716,8 +718,9 @@ class ASLGui:
                         self.led_controller.set_no_gesture()
                     
                     # Agregar letra al texto si es válida
-                    if new_letter and new_letter.strip():
+                    if new_letter is not None:
                         self.update_queue.put(('new_letter', new_letter))
+
                     
                     # Enviar actualización a la GUI
                     self.update_queue.put(('gesture', gesture_text, confidence, gesture_detected))
